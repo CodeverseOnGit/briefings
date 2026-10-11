@@ -1,0 +1,23 @@
+name: Daily briefing
+
+on:
+  schedule:
+    # Cron runs in UTC. This is 05:00 UTC on every 2nd day of the month
+    # (days 1, 3, 5, ... 31); adjust the hour to your timezone.
+    - cron: "0 5 */2 * *"
+  workflow_dispatch: {}   # lets you run it manually from the Actions tab
+
+jobs:
+  briefing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python briefing.py
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
+          CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
