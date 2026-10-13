@@ -23,20 +23,16 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
-from dotenv import load_dotenv
 import feedparser
 import requests
 from anthropic import Anthropic
-
-load_dotenv(Path(__file__).resolve().with_name(".env"))
 
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
 LOOKBACK_HOURS = 54       # 2 days + buffer; only consider stories newer than this
 MAX_PER_FEED = 25         # newest N entries read from each feed
 MAX_ITEMS_TO_CLAUDE = 60  # cap on stories sent to Claude per topic
-MAX_STORIES = 5           # stories per topic
+DEFAULT_STORIES = 7       # stories per topic unless a topic sets "max_stories"
 # CallMeBot appears to cut long messages, so we send short ones. Run
 # `python briefing.py --test-length` to find your real limit, then raise these.
 MSG_LIMIT = int(os.environ.get("MSG_LIMIT", "700"))
@@ -92,6 +88,20 @@ TOPICS = {
             "https://www.cnbc.com/id/100003114/device/rss/rss.html",
             "https://feeds.marketwatch.com/marketwatch/topstories/",
         ],
+        "max_stories": 5,
+    },
+    "stocks": {
+        "title": "Stocks to watch",
+        "kind": "stocks",
+        "max_stories": 5,
+        "focus": "A long-term investor putting in about $1,000 a month. Established "
+                 "large and mid-size companies with a clear current reason to look "
+                 "at them (earnings, guidance, product or sector news).",
+        "feeds": [
+            "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+            "https://feeds.marketwatch.com/marketwatch/topstories/",
+            "https://finance.yahoo.com/news/rssindex",
+        ],
     },
 }
 # ---------------------------------------------------------------------------
@@ -136,14 +146,34 @@ def fetch_items(feeds):
 
 
 def summarize(client, topic, items):
+    limit = topic.get("max_stories", DEFAULT_STORIES)
+    is_stocks = topic.get("kind") == "stocks"
     stories = "\n".join(
         f"- [{i['source']}] {i['title']} :: {i['summary']} ({i['link']})"
         for i in items
     )
-    prompt = f"""You are writing a briefing on {topic['title']} for one reader.
+    if is_stocks:
+        prompt = f"""You are preparing a "stocks to watch" list for one reader.
+Reader profile: {topic['focus']}
+
+Using the market news below plus well-established facts you are confident about,
+pick up to {limit} stocks worth considering. Prefer large, established companies
+with a clear, current reason. No penny stocks, no hype, no price targets, no
+guarantees, and never invent numbers or news.
+
+Return ONLY a JSON array (no markdown fences, no commentary) of objects with:
+- "ticker": the stock ticker symbol
+- "company": the company name
+- "why": ONE line under 130 characters on why it is worth a look now
+- "link": URL of a story below that supports the pick, or "" if none
+
+Stories:
+{stories}"""
+    else:
+        prompt = f"""You are writing a briefing on {topic['title']} for one reader.
 Reader cares about: {topic['focus']}
 
-From the stories below, pick the {MAX_STORIES} most important (fewer if little matters).
+From the stories below, pick the {limit} most important (fewer if little matters).
 Merge duplicate stories. Rank by importance.
 
 Return ONLY a JSON array (no markdown fences, no commentary) of objects with:
@@ -157,60 +187,44 @@ Stories:
 {stories}"""
     response = client.messages.create(
         model=MODEL,
-        max_tokens=2400,
+        max_tokens=1500,
         messages=[{"role": "user", "content": prompt}],
     )
     text = "".join(b.text for b in response.content if b.type == "text").strip()
     text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
-    if not text:
-        raise ValueError(
-            f"Claude returned no text (stop reason: {response.stop_reason!r})"
-        )
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        start, end = text.find("["), text.rfind("]")
-        if start < 0:
-            raise ValueError(
-                "Claude did not return a JSON array "
-                f"(stop reason: {response.stop_reason!r}). Response starts with: "
-                f"{text[:300]!r}"
-            )
-        if end < start:
-            reason = response.stop_reason
-            if reason == "max_tokens":
-                detail = "output token limit reached"
-            else:
-                detail = f"stop reason: {reason!r}"
-            raise ValueError(
-                f"Claude returned an incomplete JSON array ({detail}). "
-                f"Response starts with: {text[:300]!r}"
-            )
-        try:
-            data = json.loads(text[start : end + 1])
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                "Claude returned invalid JSON "
-                f"(line {exc.lineno}, column {exc.colno}). Response starts with: "
-                f"{text[:300]!r}"
-            ) from exc
-    if not isinstance(data, list):
-        raise ValueError("Claude response must be a JSON array of stories")
-    return [s for s in data if s.get("headline") and s.get("link")][:MAX_STORIES]
+        first, last = text.find("["), text.rfind("]")
+        data = json.loads(text[first : last + 1])
+    if is_stocks:
+        data = [s for s in data if s.get("ticker") and s.get("why")]
+    else:
+        data = [s for s in data if s.get("headline") and s.get("link")]
+    return data[:limit]
+
+
+def format_story(topic, n, s):
+    if topic.get("kind") == "stocks":
+        lines = [f"*{n}. {s['ticker']} - {s.get('company', '')}*", s["why"]]
+        if s.get("link"):
+            lines.append(s["link"])
+        return "\n".join(lines)
+    # link first, so it survives any cut
+    return f"*{n}. {s['headline']}*\n{s['link']}\n{s.get('why', '')}".strip()
 
 
 def build_messages(topic, stories):
-    """One short message per story (link first, so it survives any cut)."""
-    texts = [
-        f"*{n}. {s['headline']}*\n{s['link']}\n{s.get('why', '')}".strip()
-        for n, s in enumerate(stories, 1)
-    ]
+    """Short messages, STORIES_PER_MESSAGE stories each."""
+    texts = [format_story(topic, n, s) for n, s in enumerate(stories, 1)]
     batches = [
         "\n\n".join(texts[i : i + STORIES_PER_MESSAGE])
         for i in range(0, len(texts), STORIES_PER_MESSAGE)
     ]
     if batches:
-        batches[0] = f"*{topic['title']} briefing*\n\n{batches[0]}"
+        batches[0] = f"*{topic['title']}*\n\n{batches[0]}"
+        if topic.get("kind") == "stocks":
+            batches[-1] += "\n\n_Ideas from today's news, not financial advice. Do your own research._"
     return batches
 
 
